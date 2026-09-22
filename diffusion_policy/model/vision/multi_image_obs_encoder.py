@@ -1,4 +1,5 @@
 from typing import Dict, Tuple, Union
+from collections.abc import Mapping
 import copy
 import torch
 import torch.nn as nn
@@ -50,7 +51,7 @@ class MultiImageObsEncoder(ModuleAttrMixin):
                 # configure model for this key
                 this_model = None
                 if not share_rgb_model:
-                    if isinstance(rgb_model, dict):
+                    if isinstance(rgb_model, Mapping):
                         # have provided model for each key
                         this_model = rgb_model[key]
                     else:
@@ -73,7 +74,7 @@ class MultiImageObsEncoder(ModuleAttrMixin):
                 input_shape = shape
                 this_resizer = nn.Identity()
                 if resize_shape is not None:
-                    if isinstance(resize_shape, dict):
+                    if isinstance(resize_shape, Mapping):
                         h, w = resize_shape[key]
                     else:
                         h, w = resize_shape
@@ -85,7 +86,7 @@ class MultiImageObsEncoder(ModuleAttrMixin):
                 # configure randomizer
                 this_randomizer = nn.Identity()
                 if crop_shape is not None:
-                    if isinstance(crop_shape, dict):
+                    if isinstance(crop_shape, Mapping):
                         h, w = crop_shape[key]
                     else:
                         h, w = crop_shape

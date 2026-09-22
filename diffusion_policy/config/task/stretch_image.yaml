@@ -1,0 +1,40 @@
+name: stretch_image
+
+dataset_path: &dataset_path /home/olagh/stretch4_policy_recorder/stretch_mouse.zarr
+
+shape_meta: &shape_meta
+  obs:
+    head_image:
+      shape: [3, 300, 320]
+      type: rgb
+    gripper_image:
+      shape: [3, 200, 320]
+      type: rgb
+    # 6 measured joints (lift, arm, wrist_yaw, wrist_pitch, wrist_roll, grip_mm)
+    # + 3 measured base velocities. The dataset uses it only as the SE(2)
+    # anchor for the action chunk.
+    agent_pos:
+      shape: [9]
+      type: low_dim
+  action:
+    # [base_dx, base_dy, base_dtheta, lift, arm, wrist_yaw, wrist_pitch,
+    #  wrist_roll, grip_mm] -- base dims are chunk-anchored SE(2) deltas.
+    shape: [9]
+
+# No simulator for this robot.
+env_runner:
+  _target_: diffusion_policy.env_runner.real_pusht_image_runner.RealPushTImageRunner
+
+dataset:
+  _target_: diffusion_policy.dataset.stretch_image_dataset.StretchImageDataset
+  zarr_path: *dataset_path
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  n_obs_steps: ${n_obs_steps}
+  seed: 42
+  val_ratio: 0.05
+  max_train_episodes: null
+  # Dims whose std is below this never moved during the demos and are
+  # mean-centred instead of range-scaled, so they cannot become noise channels.
+  frozen_std: 1.0e-3
