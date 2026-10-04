@@ -1,6 +1,7 @@
 defaults:
   - _self_
-  - task: stretch_image
+  # Pick another with task=<name> on the command line.
+  - task: stretch4_mt_bin_image
 
 name: train_diffusion_unet_stretch
 _target_: diffusion_policy.workspace.train_diffusion_unet_image_workspace.TrainDiffusionUnetImageWorkspace
@@ -42,9 +43,8 @@ policy:
       name: resnet18
       weights: null
     resize_shape: null
-    crop_shape:
-      head_image: [268, 288]      # from 300,320
-      gripper_image: [180, 288]   # from 200x320
+    # Per camera, so it lives in the task yaml next to shape_meta.
+    crop_shape: ${task.crop_shape}
     # setting this False currently yields NO crop at all, not a centre crop
     random_crop: True
     use_group_norm: True
@@ -103,15 +103,7 @@ training:
   # optimization
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  # 600 is what BOTH real-robot reference configs use (3050/8000 are the sim
-  # benchmarks). Do not scale this with dataset size: an epoch is one pass over
-  # the data, so more episodes already gives proportionally more gradient steps
-  # at the same num_epochs. Measured, horizon 48 / batch 32:
-  #     8 eps ->  43 steps/epoch ->  25.8k steps over 600 epochs
-  #    50 eps -> 300 steps/epoch -> 180k   steps over 600 epochs
-  # The cosine schedule spans num_epochs, so raising it lengthens LR decay --
-  # it is not just a later stopping point.
-  num_epochs: 600
+  num_epochs: 180
   gradient_accumulate_every: 1
   # EMA destroys performance when used with BatchNorm
   # replace BatchNorm with GroupNorm.
@@ -119,7 +111,7 @@ training:
   freeze_encoder: False
   # training loop control
   rollout_every: 100000
-  checkpoint_every: 50
+  checkpoint_every: 10
   val_every: 1
   sample_every: 5
   # steps per epoch
@@ -141,7 +133,7 @@ checkpoint:
   topk:
     monitor_key: val_loss
     mode: min
-    k: 5
+    k: 7
     format_str: 'epoch={epoch:04d}-val_loss={val_loss:.4f}.ckpt'
   save_last_ckpt: True
   save_last_snapshot: False

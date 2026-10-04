@@ -10,7 +10,7 @@ if __name__ == "__main__":
 import os
 import hydra
 import torch
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 import pathlib
 from torch.utils.data import DataLoader
 import copy
@@ -67,11 +67,22 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
             if lastest_ckpt_path.is_file():
                 print(f"Resuming from checkpoint {lastest_ckpt_path}")
                 self.load_checkpoint(path=lastest_ckpt_path)
+                # Checkpoints are only saved at the end of an epoch, before the loop
+                # advances epoch and global_step, so the restored values name work
+                # that is already done. Advance them, or that epoch is trained twice.
+                self.epoch += 1
+                self.global_step += 1
 
         # configure dataset
         dataset: BaseImageDataset
         dataset = hydra.utils.instantiate(cfg.task.dataset)
         assert isinstance(dataset, BaseImageDataset)
+        # Stretch: joints the dataset decided to hold still. Saved in the checkpoint's cfg
+        # so the robot holds them too, and logged with the reasons in the run dir.
+        if hasattr(dataset, 'held_joints'):
+            with open_dict(self.cfg):
+                self.cfg.task.held_joints = dataset.held_joints
+            dataset.write_hold_report(os.path.join(self.output_dir, 'held_joints.json'))
         train_dataloader = DataLoader(dataset, **cfg.dataloader)
         normalizer = dataset.get_normalizer()
 
@@ -150,7 +161,10 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
         # training loop
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
         with JsonLogger(log_path) as json_logger:
-            for local_epoch_idx in range(cfg.training.num_epochs):
+            # Run until num_epochs in total, not num_epochs more: a resumed run restores
+            # self.epoch, and the cosine LR schedule (sized for num_epochs) climbs back up
+            # past its end.
+            while self.epoch < cfg.training.num_epochs:
                 step_log = dict()
                 # ========= train for this epoch ==========
                 if cfg.training.freeze_encoder:
@@ -287,6 +301,10 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                 json_logger.log(step_log)
                 self.global_step += 1
                 self.epoch += 1
+
+            # Checkpoints are only written every checkpoint_every epochs, so without this
+            # the last epochs of training never reach latest.ckpt.
+            self.save_checkpoint(use_thread=False)
 
 @hydra.main(
     version_base=None,

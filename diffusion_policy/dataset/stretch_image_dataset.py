@@ -1,7 +1,9 @@
 from typing import Dict
 import copy
+import os
 import numpy as np
 import torch
+import zarr
 
 from threadpoolctl import threadpool_limits
 from diffusion_policy.common.pytorch_util import dict_apply
@@ -14,14 +16,113 @@ from diffusion_policy.model.common.normalizer import (
     LinearNormalizer, SingleFieldLinearNormalizer)
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
 
-# Recorder schema:
-#   ACTION_COLUMNS = [base_x, base_y, base_theta, lift, arm,
-#                     wrist_yaw, wrist_pitch, wrist_roll, grip_mm]
-#   STATE_COLUMNS  = ACTION_COLUMNS + [base_vx, base_vy, base_omega]
-#   action[t] = state[t+1][0:9]; final frame of each episode dropped.
-BASE_SLICE = slice(0, 3)      # base_x, base_y, base_theta -- raw absolute odom
-JOINT_SLICE = slice(3, 9)     # lift, arm, wrist_yaw, wrist_pitch, wrist_roll, grip_mm
-VEL_SLICE = slice(9, 12)      # base_vx, base_vy, base_omega
+# Zarr written by stretch4_to_zarr. Columns are read by name from
+# the zarr attrs; this is just the expected layout:
+#   state     (9|10)  lift, arm, wrist_yaw, wrist_pitch, wrist_roll, grip_mm,
+#                     base_vx, base_vy, base_omega [, grip_effort]   -- never odometry
+#   base_odom (3)     base_x, base_y, base_theta: the anchor for pose actions only
+#   action    (9|10)  base(3) at t+1, lift..grip_mm at t+1 [, grip_effort at t+1]
+#                     base(3) = base_x/y/theta   (base_action: pose)
+#                             = base_vx/vy/omega (base_action: velocity)
+SCHEMA = 'stretch4 zarr v2'
+BASE_ACTIONS = ('pose', 'velocity')
+BASE_ACTION_COLUMNS = {
+    'pose': ['base_x', 'base_y', 'base_theta'],
+    'velocity': ['base_vx', 'base_vy', 'base_omega'],
+}
+ODOM_COLUMNS = BASE_ACTION_COLUMNS['pose']
+BASE = slice(0, 3)            # base dims of the action
+JOINTS = ['lift', 'arm', 'wrist_yaw', 'wrist_pitch', 'wrist_roll', 'grip_mm']
+# Within-episode range a joint must exceed to count as "moved" in that episode, in its
+# own units. Well above encoder drift of a joint held still, well below any real motion.
+DEFAULT_MIN_MOTION = {'lift': 0.005, 'arm': 0.005,                    # m
+                      'wrist_yaw': 0.02, 'wrist_pitch': 0.02,         # rad (~1 deg)
+                      'wrist_roll': 0.02,
+                      'grip_mm': 1.0}                                 # mm
+# A live dim whose true extremes normalize beyond this gets a warning.
+OUTLIER_WARN = 3.0
+
+
+def decide_held_joints(action, action_cols, episode_ends, episode_names=None,
+                       min_episode_frac=0.1, min_motion=None, hold_joints=(),
+                       keep_joints=(), auto=True):
+    """Which joints the policy should not learn, and why.
+
+    A joint moved in too few episodes cannot be learned -- one demonstration of *when* to
+    use it is noise -- and it wrecks normalization: its few moving frames sit far outside
+    the percentile range every other episode sets, at hundreds of times the normal scale.
+    Such a joint is held: the dataset replaces it with a constant, and the robot keeps it
+    where it is.
+
+    A joint "moved" in an episode if its range there exceeds min_motion[joint]. It is held
+    automatically if it moved in fewer than `min_episode_frac` of the episodes. hold_joints
+    are held regardless; keep_joints are never held.
+
+    Returns ({joint: {'value', 'reason'}}, report), report being one dict per joint.
+    """
+    min_motion = {**DEFAULT_MIN_MOTION, **(min_motion or {})}
+    for name in [*hold_joints, *keep_joints]:
+        if name not in JOINTS:
+            raise ValueError(f"hold/keep joint {name!r} is not one of {JOINTS}")
+    both = set(hold_joints) & set(keep_joints)
+    if both:
+        raise ValueError(f"{sorted(both)} are in both hold_joints and keep_joints")
+
+    ends = np.asarray(episode_ends)
+    starts = np.concatenate([[0], ends[:-1]])
+    names = list(episode_names) if episode_names is not None else \
+        [f'episode {i}' for i in range(len(ends))]
+    n_eps = len(ends)
+    held, report = {}, []
+    for joint in JOINTS:
+        x = action[:, action_cols.index(joint)].astype(np.float64)
+        ranges = np.array([np.ptp(x[s:e]) if e > s else 0.0 for s, e in zip(starts, ends)])
+        moved = [names[i] for i in np.nonzero(ranges > min_motion[joint])[0]]
+        frac = len(moved) / max(n_eps, 1)
+        entry = {
+            'joint': joint,
+            'episodes_moved': len(moved), 'episodes': n_eps,
+            'fraction_moved': round(frac, 4),
+            'min_motion': min_motion[joint],
+            'q01': float(np.percentile(x, 1)), 'q99': float(np.percentile(x, 99)),
+            'min': float(x.min()), 'max': float(x.max()), 'median': float(np.median(x)),
+            # the names are only informative when few episodes moved it
+            'moved_in': moved if len(moved) <= 10 else None,
+        }
+        if joint in hold_joints:
+            decision, reason = 'held', 'listed in hold_joints'
+        elif joint in keep_joints:
+            decision, reason = 'learned', 'listed in keep_joints'
+        elif auto and frac < min_episode_frac:
+            decision = 'held'
+            where = (f" ({', '.join(moved)})" if moved else '')
+            reason = (f"moved more than {min_motion[joint]:g} in {len(moved)}/{n_eps} "
+                      f"episodes{where}, below min_episode_frac {min_episode_frac:g}: too "
+                      "rare to learn, and its moving frames would sit far outside the "
+                      "normalization range")
+        else:
+            decision = 'learned'
+            reason = (f"moved in {len(moved)}/{n_eps} episodes "
+                      f"(>= min_episode_frac {min_episode_frac:g})" if auto else
+                      'automatic holding is off')
+        entry['decision'], entry['reason'] = decision, reason
+        report.append(entry)
+        if decision == 'held':
+            held[joint] = {'value': entry['median'], 'reason': reason}
+    return held, report
+
+
+def format_hold_report(report):
+    lines = ["[stretch] joint hold decisions (task.hold; robot holds 'held' joints still):",
+             f"[stretch]   {'joint':12s} {'moved':>9s}  {'q01..q99':>23s}  {'min..max':>23s}  decision"]
+    for r in report:
+        lines.append(
+            f"[stretch]   {r['joint']:12s} {r['episodes_moved']:>4d}/{r['episodes']:<4d}  "
+            f"{r['q01']:>11.5g}..{r['q99']:<11.5g} {r['min']:>11.5g}..{r['max']:<11.5g} "
+            f"{r['decision'].upper()}")
+        if r['decision'] == 'held':
+            lines.append(f"[stretch]     -> {r['reason']}")
+    return "\n".join(lines)
 
 
 def se2_relative(poses, anchor):
@@ -62,8 +163,10 @@ def make_masked_range_normalizer(data, frozen_std=1e-3, pct=1.0, verbose=True,
     signal. Those dims are instead mean-centred with unit scale, so they contribute
     a constant ~0 and denormalize back to the value they were pinned at.
 
-    Live dimensions use 1st/99th percentile limits rather than true min/max, so a
-    single outlier frame cannot set the scale for the whole dataset.
+    Live dimensions are scaled from the `pct`..`100-pct` percentiles. pct=0 is true
+    min/max, which the action needs: the scheduler's clip_sample clips predictions to
+    [-1, 1], so an action beyond the scale could never be produced at inference. The
+    observation is never clipped, so it can use pct=1 and ignore stray frames.
     """
     data = np.asarray(data, dtype=np.float32)
     stat = array_to_stats(data)
@@ -81,6 +184,23 @@ def make_masked_range_normalizer(data, frozen_std=1e-3, pct=1.0, verbose=True,
     scale[frozen] = 1.0
     offset[frozen] = -stat['mean'][frozen]
 
+    # Live dims whose true extremes land far outside [-1, 1]: a few frames move much
+    # more than the rest. Usually a joint used in one or two episodes -- see
+    # decide_held_joints, which holds those before they reach this point.
+    n_lo, n_hi = stat['min'] * scale + offset, stat['max'] * scale + offset
+    extreme = np.maximum(np.abs(n_lo), np.abs(n_hi))
+    outliers = ~frozen & (extreme > OUTLIER_WARN)
+    if verbose and outliers.any():
+        for i in np.nonzero(outliers)[0]:
+            name = names[i] if names else str(i)
+            hint = (" If it is used in only a few episodes, consider task.hold.hold_joints."
+                    if name in JOINTS else
+                    " Heavy-tailed but real; fine as long as this is an observation (never"
+                    " clipped).")
+            print(f"[stretch] NOTE {name}: normalizes to [{n_lo[i]:.1f}, {n_hi[i]:.1f}], "
+                  f"the {pct:g}-{100 - pct:g}% range is [{lo[i]:.5g}, {hi[i]:.5g}] but the "
+                  f"data spans [{stat['min'][i]:.5g}, {stat['max'][i]:.5g}].{hint}")
+
     if verbose and frozen.any():
         idx = np.nonzero(frozen)[0]
         label = [(names[i] if names else str(i)) for i in idx]
@@ -97,19 +217,23 @@ def make_masked_range_normalizer(data, frozen_std=1e-3, pct=1.0, verbose=True,
 
 
 class StretchImageDataset(BaseImageDataset):
-    """Stretch 4 recorder zarr -> diffusion policy.
+    """Stretch 4 zarr (stretch4_to_zarr) -> diffusion policy.
 
-    Two things happen here that the raw zarr does not do:
-
-    1. The base action (dims 0:3, raw absolute odometry) is converted to a
-       chunk-anchored SE(2) delta, anchored on the base pose at the last
-       observation step.
-    2. Absolute odometry is kept out of the observation entirely. Its origin is
-       arbitrary at test time, so feeding it to the policy trains on noise. The
-       base is represented to the policy by its measured velocity instead.
+    - Cameras are the `type: rgb` keys of shape_meta, so any subset of the zarr's
+      `<cam>_image` arrays (one head, both heads, gripper) can be trained on.
+    - agent_pos is the zarr's state as stored: joints + base velocity, plus grip_effort
+      when `include_grip_effort`.
+    - base_action 'pose': the base action dims (absolute odometry at t+1) become a
+      chunk-anchored SE(2) delta, anchored on base_odom at the last observation step.
+      base_action 'velocity': the base dims are body-frame velocities, used as they are.
+    - Joints moved in too few episodes are held (decide_held_joints): replaced by a
+      constant in both action and agent_pos, and kept still by the robot. The decision
+      is printed, written to <run dir>/held_joints.json, and saved in the checkpoint's
+      cfg.task.held_joints.
     """
 
     def __init__(self,
+                 shape_meta,
                  zarr_path,
                  horizon=1,
                  pad_before=0,
@@ -118,10 +242,92 @@ class StretchImageDataset(BaseImageDataset):
                  seed=42,
                  val_ratio=0.0,
                  max_train_episodes=None,
+                 base_action='pose',
+                 include_grip_effort=False,
+                 hold=None,
                  frozen_std=1e-3):
         super().__init__()
+        zarr_path = os.path.expanduser(zarr_path)
+        group = zarr.open(zarr_path, 'r')
+        attrs = dict(group.attrs)
+        if attrs.get('schema') != SCHEMA:
+            raise ValueError(
+                f"{zarr_path} has schema {attrs.get('schema')!r}, expected {SCHEMA!r}. "
+                "Reconvert it with the current stretch4_to_zarr (older zarrs put odometry "
+                "in the state).")
+
+        print(f"[stretch] {zarr_path}: base_action={attrs.get('base_action')}, "
+              f"lookahead={attrs.get('lookahead', 1)} (action[t] targets state[t+K]), "
+              f"cameras {[k for k in group['data'].array_keys() if k.endswith('_image')]}")
+
+        # --- cameras ---
+        self.rgb_keys = [k for k, v in shape_meta['obs'].items() if v.get('type') == 'rgb']
+        have = sorted(k for k in group['data'].array_keys() if k.endswith('_image'))
+        missing = [k for k in self.rgb_keys if k not in have]
+        if missing:
+            raise ValueError(f"shape_meta wants {missing}, but {zarr_path} only has {have}")
+        for k in self.rgb_keys:
+            want = tuple(shape_meta['obs'][k]['shape'])
+            h, w, c = group['data'][k].shape[1:]
+            if want != (c, h, w):
+                raise ValueError(f"shape_meta {k} is {list(want)}, but the zarr's frames are "
+                                 f"{[c, h, w]} (CHW)")
+
+        # --- columns ---
+        if base_action not in BASE_ACTIONS:
+            raise ValueError(f"base_action must be one of {BASE_ACTIONS}, got {base_action!r}")
+        if attrs.get('base_action') != base_action:
+            raise ValueError(
+                f"task base_action is {base_action!r}, but {zarr_path} was converted with "
+                f"--base-action {attrs.get('base_action')!r}. Set task.base_action to match "
+                "(the robot reads it from the checkpoint to decode the base).")
+        state_cols = list(attrs['state_columns'])
+        action_cols = list(attrs['action_columns'])
+        leaked = [c for c in ODOM_COLUMNS if c in state_cols]
+        if leaked:
+            raise ValueError(f"{zarr_path} state holds odometry {leaked}; reconvert it")
+        if action_cols[BASE] != BASE_ACTION_COLUMNS[base_action]:
+            raise ValueError(f"action columns {action_cols[BASE]} are not "
+                             f"{BASE_ACTION_COLUMNS[base_action]} for base_action {base_action!r}")
+        if include_grip_effort and not ('grip_effort' in state_cols
+                                        and 'grip_effort' in action_cols):
+            raise ValueError(f"include_grip_effort is true, but {zarr_path} has no grip_effort "
+                             "column; reconvert with stretch4_to_zarr --grip-effort")
+        keep = (lambda c: include_grip_effort or c != 'grip_effort')
+        self.state_index = [i for i, c in enumerate(state_cols) if keep(c)]
+        self.action_index = [i for i, c in enumerate(action_cols) if keep(c)]
+        self.agent_names = [state_cols[i] for i in self.state_index]
+        self.action_names = [action_cols[i] for i in self.action_index]
+        if base_action == 'pose':
+            self.action_names[BASE] = ['base_dx', 'base_dy', 'base_dtheta']
+
+        for key, width, names in (
+                ('obs.agent_pos', shape_meta['obs']['agent_pos']['shape'][0], self.agent_names),
+                ('action', shape_meta['action']['shape'][0], self.action_names)):
+            if width != len(names):
+                raise ValueError(
+                    f"shape_meta {key} is [{width}], but include_grip_effort="
+                    f"{include_grip_effort} gives {len(names)} columns: {names}")
+
+        # --- buffer and sampler ---
+        self.low_dim_keys = ['state', 'action'] + (['base_odom'] if base_action == 'pose' else [])
         self.replay_buffer = ReplayBuffer.copy_from_path(
-            zarr_path, keys=['head_image', 'gripper_image', 'state', 'action'])
+            zarr_path, keys=self.rgb_keys + self.low_dim_keys)
+
+        # --- held joints ---
+        hold = dict(hold or {})
+        self.held_joints, self.hold_report = decide_held_joints(
+            self.replay_buffer['action'][:], action_cols, self.replay_buffer.episode_ends[:],
+            episode_names=attrs.get('episodes'),
+            min_episode_frac=float(hold.get('min_episode_frac', 0.1)),
+            min_motion=dict(hold.get('min_motion') or {}),
+            hold_joints=list(hold.get('hold_joints') or []),
+            keep_joints=list(hold.get('keep_joints') or []),
+            auto=bool(hold.get('auto', True)))
+        print(format_hold_report(self.hold_report))
+        # (column in the output action, column in agent_pos, constant) per held joint
+        self._held_cols = [(self.action_names.index(j), self.agent_names.index(j), h['value'])
+                           for j, h in self.held_joints.items()]
 
         val_mask = get_val_mask(
             n_episodes=self.replay_buffer.n_episodes,
@@ -131,10 +337,10 @@ class StretchImageDataset(BaseImageDataset):
             mask=train_mask, max_n=max_train_episodes, seed=seed)
 
         # Only the first n_obs_steps of each OBS key are ever used (the policy
-        # slices obs[:, :n_obs_steps] for the global cond), but `action` needs the
-        # full horizon.
-        self.key_first_k = {k: n_obs_steps
-                            for k in ['head_image', 'gripper_image', 'state']}
+        # slices obs[:, :n_obs_steps] for the global cond, and the pose anchor is
+        # base_odom[n_obs_steps-1]), but `action` needs the full horizon.
+        self.key_first_k = {k: n_obs_steps for k in self.rgb_keys + self.low_dim_keys
+                            if k != 'action'}
 
         self.sampler = SequenceSampler(
             replay_buffer=self.replay_buffer,
@@ -148,7 +354,22 @@ class StretchImageDataset(BaseImageDataset):
         self.pad_before = pad_before
         self.pad_after = pad_after
         self.n_obs_steps = n_obs_steps
+        self.base_action = base_action
         self.frozen_std = frozen_std
+
+    def _hold(self, action=None, agent_pos=None):
+        """Overwrite held joints with their constant, in place (see decide_held_joints)."""
+        for a_col, s_col, value in self._held_cols:
+            if action is not None:
+                action[..., a_col] = value
+            if agent_pos is not None:
+                agent_pos[..., s_col] = value
+
+    def write_hold_report(self, path):
+        """The hold decisions, with the statistics behind them, as JSON."""
+        import json
+        with open(path, 'w') as f:
+            json.dump({'held_joints': self.held_joints, 'joints': self.hold_report}, f, indent=2)
 
     def get_validation_dataset(self):
         val_set = copy.copy(self)
@@ -162,79 +383,67 @@ class StretchImageDataset(BaseImageDataset):
         val_set.train_mask = ~self.train_mask
         return val_set
 
-    def _relative_action_population(self):
-        """Every (anchor, chunk) pair the sampler can produce, as relative actions.
+    def _action_population(self):
+        """The actions as the policy sees them, for fitting the normalizer.
 
-        The normalizer has to be fit on the distribution the policy actually sees.
-        Fitting on raw absolute odometry would set the base scale from the size of
-        the room rather than from how far the base moves in one chunk.
+        Pose: every (anchor, chunk) pair the sampler can produce, as relative actions.
+        Fitting on raw absolute odometry would set the base scale from the size of the
+        room rather than from how far the base moves in one chunk. Velocity: the
+        actions as stored, since nothing is re-anchored.
         """
-        state = self.replay_buffer['state'][:]
-        action = self.replay_buffer['action'][:]
+        action = self.replay_buffer['action'][:][:, self.action_index]
+        self._hold(action=action)
+        if self.base_action == 'velocity':
+            return action.astype(np.float32)
+
+        odom = self.replay_buffer['base_odom'][:]
         ends = self.replay_buffer.episode_ends[:]
         starts = np.concatenate([[0], ends[:-1]])
-
         out = []
         for s, e in zip(starts, ends):
-            st_pose = state[s:e, BASE_SLICE]
-            act_pose = action[s:e, BASE_SLICE]
-            act_joint = action[s:e, JOINT_SLICE]
+            ep_odom, ep_action = odom[s:e], action[s:e]
             L = e - s
             for t in range(L):
                 a_idx = min(t + self.n_obs_steps - 1, L - 1)
                 w = slice(t, min(t + self.horizon, L))
-                rel = se2_relative(act_pose[w], st_pose[a_idx])
-                out.append(np.concatenate([rel, act_joint[w]], axis=-1))
+                rel = se2_relative(ep_action[w, BASE], ep_odom[a_idx])
+                out.append(np.concatenate([rel, ep_action[w, 3:]], axis=-1))
         return np.concatenate(out, axis=0).astype(np.float32)
 
     def get_normalizer(self, mode='limits', **kwargs):
-        action_names = ['base_dx', 'base_dy', 'base_dtheta', 'lift', 'arm',
-                        'wrist_yaw', 'wrist_pitch', 'wrist_roll', 'grip_mm']
-        agent_names = ['lift', 'arm', 'wrist_yaw', 'wrist_pitch', 'wrist_roll',
-                       'grip_mm', 'base_vx', 'base_vy', 'base_omega']
-
         normalizer = LinearNormalizer()
+        # true min/max (pct=0): clip_sample clips predictions to [-1, 1]
         normalizer['action'] = make_masked_range_normalizer(
-            self._relative_action_population(),
-            frozen_std=self.frozen_std, names=action_names)
+            self._action_population(), pct=0.0,
+            frozen_std=self.frozen_std, names=self.action_names)
 
-        state = self.replay_buffer['state'][:]
-        agent_pos = np.concatenate(
-            [state[:, JOINT_SLICE], state[:, VEL_SLICE]], axis=-1)
+        agent_pos = self.replay_buffer['state'][:][:, self.state_index]
+        self._hold(agent_pos=agent_pos)
         normalizer['agent_pos'] = make_masked_range_normalizer(
-            agent_pos, frozen_std=self.frozen_std, names=agent_names)
+            agent_pos, frozen_std=self.frozen_std, names=self.agent_names)
 
-        normalizer['head_image'] = get_image_range_normalizer()
-        normalizer['gripper_image'] = get_image_range_normalizer()
+        for k in self.rgb_keys:
+            normalizer[k] = get_image_range_normalizer()
         return normalizer
 
     def __len__(self) -> int:
         return len(self.sampler)
 
     def _sample_to_data(self, sample):
-        state = sample['state'].astype(np.float32)
-        action = sample['action'].astype(np.float32)
-
-        # Anchor the whole action chunk on the base pose at the last obs step.
-        anchor = state[self.n_obs_steps - 1, BASE_SLICE]
-        base_rel = se2_relative(action[:, BASE_SLICE], anchor)
-        action_out = np.concatenate(
-            [base_rel, action[:, JOINT_SLICE]], axis=-1).astype(np.float32)
-
-        agent_pos = np.concatenate(
-            [state[:, JOINT_SLICE], state[:, VEL_SLICE]], axis=-1).astype(np.float32)
-
         # Beyond n_obs_steps the obs arrays are unloaded filler
         # so they must be sliced away here rather than handed to the policy.
         To = self.n_obs_steps
-        return {
-            'obs': {
-                'head_image': np.moveaxis(sample['head_image'][:To], -1, 1).astype(np.float32) / 255.,
-                'gripper_image': np.moveaxis(sample['gripper_image'][:To], -1, 1).astype(np.float32) / 255.,
-                'agent_pos': agent_pos[:To],
-            },
-            'action': action_out,
-        }
+        action = sample['action'][:, self.action_index].astype(np.float32)
+        if self.base_action == 'pose':
+            # Anchor the whole action chunk on the base pose at the last obs step.
+            anchor = sample['base_odom'][To - 1].astype(np.float64)
+            action[:, BASE] = se2_relative(action[:, BASE].astype(np.float64), anchor)
+
+        obs = {k: np.moveaxis(sample[k][:To], -1, 1).astype(np.float32) / 255.
+               for k in self.rgb_keys}
+        obs['agent_pos'] = sample['state'][:To, self.state_index].astype(np.float32)
+        self._hold(action=action, agent_pos=obs['agent_pos'])
+        return {'obs': obs, 'action': action}
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         # stop each worker's BLAS from spawning a full thread pool
@@ -243,21 +452,30 @@ class StretchImageDataset(BaseImageDataset):
         return dict_apply(self._sample_to_data(sample), torch.from_numpy)
 
 
-def test():
-    import os
-    zarr_path = os.path.expanduser(
-        '~/stretch4_policy_recorder/stretch_test.zarr')
-    ds = StretchImageDataset(zarr_path, horizon=16, pad_before=1, pad_after=7,
-                             n_obs_steps=2, val_ratio=0.125)
+def test(zarr_path, base_action='pose', include_grip_effort=False):
+    """python -m diffusion_policy.dataset.stretch_image_dataset <zarr> [pose|velocity] [effort]"""
+    group = zarr.open(os.path.expanduser(zarr_path), 'r')
+    attrs = dict(group.attrs)
+    n_state = len(attrs['state_columns']) - (0 if include_grip_effort else
+                                             int('grip_effort' in attrs['state_columns']))
+    obs = {k: {'shape': [group['data'][k].shape[3], *group['data'][k].shape[1:3]], 'type': 'rgb'}
+           for k in group['data'].array_keys() if k.endswith('_image')}
+    obs['agent_pos'] = {'shape': [n_state], 'type': 'low_dim'}
+    shape_meta = {'obs': obs, 'action': {'shape': [n_state]}}
+    ds = StretchImageDataset(shape_meta, zarr_path, horizon=48, pad_before=3, pad_after=23,
+                             n_obs_steps=4, val_ratio=0.05, base_action=base_action,
+                             include_grip_effort=include_grip_effort)
     print('len', len(ds), 'episodes', ds.replay_buffer.n_episodes)
     b = ds[0]
     for k, v in b['obs'].items():
         print(' obs', k, tuple(v.shape), v.dtype, float(v.min()), float(v.max()))
-    print(' action', tuple(b['action'].shape), b['action'].dtype)
+    print(' action', tuple(b['action'].shape), b['action'].dtype, ds.action_names)
+    if base_action == 'pose':
+        # the action at the anchor step is the next frame, so its delta is one step of motion
+        print(' base delta at the anchor step', b['action'][ds.n_obs_steps - 1, :3].numpy())
 
     n = ds.get_normalizer()
-    pop = ds._relative_action_population()
-    na = n['action'].normalize(pop)
+    na = n['action'].normalize(ds._action_population())
     print('normalized action min/max per dim:')
     print(' min', np.array2string(na.min(0).values.detach().numpy(), precision=3))
     print(' max', np.array2string(na.max(0).values.detach().numpy(), precision=3))
@@ -273,4 +491,5 @@ def test():
 
 
 if __name__ == '__main__':
-    test()
+    import sys
+    test(sys.argv[1], *(sys.argv[2:3] or ['pose']), include_grip_effort='effort' in sys.argv[3:])

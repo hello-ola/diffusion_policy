@@ -1,0 +1,88 @@
+# Stretch 4: pick up the measuring tape and place it in the bin.
+# 100 episodes, 30 Hz, head_left + head_right + gripper.
+name: stretch4_mt_bin_image
+
+# stretch4_to_zarr --raw ~/stretch4_mt_bin/stretch4_mt_bin --out <this> --head-cameras both
+#   --grip-effort --image-width 320
+#   --head-left-crop 235,783,810,843 --head-right-crop 160,719,860,934
+dataset_path: /home/olagh/stretch4_mt_bin/mt_bin_pose.zarr
+
+# Must equal the zarr's attrs.base_action (the converter's --base-action). The robot
+# reads it from the checkpoint to decode action dims 0:3.
+base_action: pose          # pose | velocity
+# Needs a zarr converted with --grip-effort. When true, agent_pos and action are 10 wide.
+include_grip_effort: false
+
+# Copied from the zarr's attrs (image_width, crops). Not used in training; the robot
+# preprocesses its live frames with it and refuses to run if it differs from the zarr.
+image_preproc:
+  image_width: 320
+  crops:
+    head_left: [235, 783, 810, 843]     # x, y, w, h on the upright native frame
+    head_right: [160, 719, 860, 934]
+    gripper: null                       # full frame
+
+shape_meta:
+  obs:
+    # CHW; must equal the zarr's data/<cam>_image shape (H, W, 3). Delete a camera
+    # here to train without it.
+    head_left_image:
+      shape: [3, 333, 320]
+      type: rgb
+    head_right_image:
+      shape: [3, 348, 320]
+      type: rgb
+    gripper_image:
+      shape: [3, 200, 320]
+      type: rgb
+    # lift, arm, wrist_yaw, wrist_pitch, wrist_roll, grip_mm, base_vx, base_vy,
+    # base_omega (+ grip_effort -> 10).
+    agent_pos:
+      shape: [9]
+      type: low_dim
+  action:
+    # pose:     [base_dx, base_dy, base_dtheta] chunk-anchored SE(2) delta
+    # velocity: [base_vx, base_vy, base_omega] body frame
+    # then lift, arm, wrist_yaw, wrist_pitch, wrist_roll, grip_mm (+ grip_effort -> 10)
+    shape: [9]
+
+# Random-crop augmentation, one per camera in shape_meta: ~90%, strictly smaller than
+# the image. The centre crop is what the policy sees at test time.
+crop_shape:
+  head_left_image: [300, 288]
+  head_right_image: [312, 288]
+  gripper_image: [180, 288]
+
+# No simulator for this robot.
+env_runner:
+  _target_: diffusion_policy.env_runner.real_pusht_image_runner.RealPushTImageRunner
+
+dataset:
+  _target_: diffusion_policy.dataset.stretch_image_dataset.StretchImageDataset
+  # Interpolations, not YAML anchors, so command-line overrides of task.* reach here.
+  shape_meta: ${task.shape_meta}
+  zarr_path: ${task.dataset_path}
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  n_obs_steps: ${n_obs_steps}
+  seed: 42
+  val_ratio: 0.05
+  max_train_episodes: null
+  base_action: ${task.base_action}
+  include_grip_effort: ${task.include_grip_effort}
+  # Joints moved in too few episodes cannot be learned and wreck normalization, so they
+  # are held: a constant in training, kept still on the robot. The decision and its
+  # reasons are printed at start-up and written to <run dir>/held_joints.json.
+  hold:
+    auto: true
+    # held if it moved in fewer than this fraction of the episodes
+    min_episode_frac: 0.1
+    # within-episode range that counts as "moved"; defaults: lift/arm 0.005 m,
+    # wrist_* 0.02 rad, grip_mm 1.0 mm. Override per joint, e.g. {wrist_roll: 0.05}
+    min_motion: {}
+    hold_joints: []     # always held, e.g. [wrist_roll]
+    keep_joints: []     # never held, even when rarely moved
+  # Dims whose std is below this never moved during the demos and are
+  # mean-centred instead of range-scaled, so they cannot become noise channels.
+  frozen_std: 1.0e-3
