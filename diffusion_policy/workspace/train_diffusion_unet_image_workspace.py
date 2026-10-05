@@ -82,6 +82,11 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
         if hasattr(dataset, 'held_joints'):
             with open_dict(self.cfg):
                 self.cfg.task.held_joints = dataset.held_joints
+                # The columns, by name and in order, so the robot builds agent_pos and reads
+                # the action the way this checkpoint was trained (it refuses a checkpoint
+                # without them rather than guess from the width).
+                self.cfg.task.agent_pos_columns = list(dataset.agent_names)
+                self.cfg.task.action_columns = list(dataset.action_names)
             dataset.write_hold_report(os.path.join(self.output_dir, 'held_joints.json'))
         train_dataloader = DataLoader(dataset, **cfg.dataloader)
         normalizer = dataset.get_normalizer()

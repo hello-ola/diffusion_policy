@@ -3,7 +3,7 @@
 name: stretch4_mt_bin_image
 
 # stretch4_to_zarr --raw ~/stretch4_mt_bin/stretch4_mt_bin --out <this> --head-cameras both
-#   --grip-effort --image-width 320
+#   --base-action pose --grip-effort --image-width 320
 #   --head-left-crop 235,783,810,843 --head-right-crop 160,719,860,934
 dataset_path: /home/olagh/stretch4_mt_bin/mt_bin_pose.zarr
 
@@ -35,8 +35,9 @@ shape_meta:
     gripper_image:
       shape: [3, 200, 320]
       type: rgb
-    # lift, arm, wrist_yaw, wrist_pitch, wrist_roll, grip_mm, base_vx, base_vy,
-    # base_omega (+ grip_effort -> 10).
+    # base_vx, base_vy, base_omega, lift, arm, wrist_yaw, wrist_pitch, wrist_roll, grip_mm
+    # (+ grip_effort -> 10): the zarr's state_columns, saved in the checkpoint as
+    # task.agent_pos_columns.
     agent_pos:
       shape: [9]
       type: low_dim
