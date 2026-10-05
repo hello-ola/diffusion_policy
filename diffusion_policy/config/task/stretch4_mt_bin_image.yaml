@@ -10,7 +10,8 @@ dataset_path: /home/olagh/stretch4_mt_bin/mt_bin_pose.zarr
 # Must equal the zarr's attrs.base_action (the converter's --base-action). The robot
 # reads it from the checkpoint to decode action dims 0:3.
 base_action: pose          # pose | velocity
-# Needs a zarr converted with --grip-effort. When true, agent_pos and action are 10 wide.
+# Needs a zarr converted with --grip-effort. When true, agent_pos is 10 wide; the action
+# stays 9 
 include_grip_effort: false
 
 # Copied from the zarr's attrs (image_width, crops). Not used in training; the robot
@@ -44,7 +45,7 @@ shape_meta:
   action:
     # pose:     [base_dx, base_dy, base_dtheta] chunk-anchored SE(2) delta
     # velocity: [base_vx, base_vy, base_omega] body frame
-    # then lift, arm, wrist_yaw, wrist_pitch, wrist_roll, grip_mm (+ grip_effort -> 10)
+    # then lift, arm, wrist_yaw, wrist_pitch, wrist_roll, grip_mm.
     shape: [9]
 
 # Random-crop augmentation, one per camera in shape_meta: ~90%, strictly smaller than

@@ -23,8 +23,8 @@ from diffusion_policy.dataset.base_dataset import BaseImageDataset
 #                     order (stretch4_policy_recorder's POLICY_STATE_COLUMNS); the names are
 #                     saved in the checkpoint (cfg.task.agent_pos_columns) for the robot.
 #   base_odom (3)     base_x, base_y, base_theta: the anchor for pose actions only
-#   action    (9|10)  base(3) at t+K, lift..grip_mm at t+K [, grip_effort at t+K]
-#                     (K = attrs.lookahead, 3 by default)
+#   action    (9)     base(3) at t+K, lift..grip_mm at t+K (K = attrs.lookahead, 3 by
+#                     default).
 #                     base(3) = base_x/y/theta   (base_action: pose)
 #                             = base_vx/vy/omega (base_action: velocity)
 SCHEMA = 'stretch4 zarr v2'
@@ -206,15 +206,13 @@ class StretchImageDataset(BaseImageDataset):
         if action_cols[BASE] != BASE_ACTION_COLUMNS[base_action]:
             raise ValueError(f"action columns {action_cols[BASE]} are not "
                              f"{BASE_ACTION_COLUMNS[base_action]} for base_action {base_action!r}")
-        if include_grip_effort and not ('grip_effort' in state_cols
-                                        and 'grip_effort' in action_cols):
+        if include_grip_effort and 'grip_effort' not in state_cols:
             raise ValueError(f"include_grip_effort is true, but {zarr_path} has no grip_effort "
                              "column; reconvert with stretch4_to_zarr --grip-effort")
         keep = (lambda c: include_grip_effort or c != 'grip_effort')
         self.state_index = [i for i, c in enumerate(state_cols) if keep(c)]
-        self.action_index = [i for i, c in enumerate(action_cols) if keep(c)]
         self.agent_names = [state_cols[i] for i in self.state_index]
-        self.action_names = [action_cols[i] for i in self.action_index]
+        self.action_names = list(action_cols)
         if base_action == 'pose':
             self.action_names[BASE] = ['base_dx', 'base_dy', 'base_dtheta']
 
@@ -224,7 +222,8 @@ class StretchImageDataset(BaseImageDataset):
             if width != len(names):
                 raise ValueError(
                     f"shape_meta {key} is [{width}], but include_grip_effort="
-                    f"{include_grip_effort} gives {len(names)} columns: {names}")
+                    f"{include_grip_effort} gives {len(names)} columns: {names} (grip_effort "
+                    "widens agent_pos only; the action is always 9)")
 
         # --- buffer and sampler ---
         self.low_dim_keys = ['state', 'action'] + (['base_odom'] if base_action == 'pose' else [])
@@ -308,7 +307,7 @@ class StretchImageDataset(BaseImageDataset):
         room rather than from how far the base moves in one chunk. Velocity: the
         actions as stored, since nothing is re-anchored.
         """
-        action = self.replay_buffer['action'][:][:, self.action_index]
+        action = self.replay_buffer['action'][:]
         self._hold(action=action)
         if self.base_action == 'velocity':
             return action.astype(np.float32)
@@ -350,7 +349,7 @@ class StretchImageDataset(BaseImageDataset):
         # Beyond n_obs_steps the obs arrays are unloaded filler
         # so they must be sliced away here rather than handed to the policy.
         To = self.n_obs_steps
-        action = sample['action'][:, self.action_index].astype(np.float32)
+        action = sample['action'].astype(np.float32)
         if self.base_action == 'pose':
             # Anchor the whole action chunk on the base pose at the last obs step.
             anchor = sample['base_odom'][To - 1].astype(np.float64)
@@ -378,7 +377,7 @@ def test(zarr_path, base_action='pose', include_grip_effort=False):
     obs = {k: {'shape': [group['data'][k].shape[3], *group['data'][k].shape[1:3]], 'type': 'rgb'}
            for k in group['data'].array_keys() if k.endswith('_image')}
     obs['agent_pos'] = {'shape': [n_state], 'type': 'low_dim'}
-    shape_meta = {'obs': obs, 'action': {'shape': [n_state]}}
+    shape_meta = {'obs': obs, 'action': {'shape': [len(attrs['action_columns'])]}}
     ds = StretchImageDataset(shape_meta, zarr_path, horizon=48, pad_before=3, pad_after=23,
                              n_obs_steps=4, val_ratio=0.05, base_action=base_action,
                              include_grip_effort=include_grip_effort)
