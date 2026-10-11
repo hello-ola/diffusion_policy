@@ -41,3 +41,19 @@ def test_columns_and_held_joints(tmp_path):
     assert list(ds.held_joints) == ["grip_mm"]
     b = ds[0]
     assert np.ptp(b["obs"]["agent_pos"][:, COLUMNS.index("grip_mm")].numpy()) == 0
+
+
+@pytest.mark.parametrize("tag, expect", [(None, "stretch_gripper"),
+                                         ("parallel_gripper", "parallel_gripper")])
+def test_gripper_tool_from_the_zarr(tmp_path, tag, expect):
+    # the workspace saves it as cfg.task.image_preproc.gripper_tool for the robot's check;
+    # an untagged zarr predates the PG4
+    make_zarr(tmp_path / "d.zarr")
+    if tag:
+        zarr.open(str(tmp_path / "d.zarr"), "r+").attrs["gripper_tool"] = tag
+    shape_meta = {"obs": {"head_left_image": {"shape": [3, 8, 8], "type": "rgb"},
+                          "agent_pos": {"shape": [9], "type": "low_dim"}},
+                  "action": {"shape": [9]}}
+    ds = S.StretchImageDataset(shape_meta, str(tmp_path / "d.zarr"), horizon=4, pad_before=1,
+                               pad_after=1, n_obs_steps=2, base_action="velocity")
+    assert ds.gripper_tool == expect

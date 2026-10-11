@@ -87,6 +87,17 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                 # without them rather than guess from the width).
                 self.cfg.task.agent_pos_columns = list(dataset.agent_names)
                 self.cfg.task.action_columns = list(dataset.action_names)
+                # The gripper it was trained with, where the robot reads it
+                # (task.image_preproc.gripper_tool).
+                pre = self.cfg.task.get('image_preproc')
+                if pre is None:
+                    self.cfg.task.image_preproc = {'gripper_tool': dataset.gripper_tool}
+                elif pre.get('gripper_tool') not in (None, dataset.gripper_tool):
+                    raise ValueError(
+                        f"task.image_preproc.gripper_tool is {pre.get('gripper_tool')!r}, but the "
+                        f"dataset was recorded with {dataset.gripper_tool!r}")
+                else:
+                    pre.gripper_tool = dataset.gripper_tool
             dataset.write_hold_report(os.path.join(self.output_dir, 'held_joints.json'))
         train_dataloader = DataLoader(dataset, **cfg.dataloader)
         normalizer = dataset.get_normalizer()

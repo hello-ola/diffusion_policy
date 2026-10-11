@@ -38,6 +38,7 @@ BASE = slice(0, 3)            # base dims of the action
 # Which joints are held
 from stretch4_policy_recorder.common.held_joints import (  # noqa: E402
     JOINTS, decide_held_joints, format_hold_report)
+from stretch4_policy_recorder.common.raw import DEFAULT_GRIPPER_TOOL  # noqa: E402
 # A live dim whose true extremes normalize beyond this gets a warning.
 OUTLIER_WARN = 3.0
 
@@ -200,6 +201,9 @@ class StretchImageDataset(BaseImageDataset):
                 "(the robot reads it from the checkpoint to decode the base).")
         state_cols = list(attrs['state_columns'])
         action_cols = list(attrs['action_columns'])
+        # SG4 or PG4 (a zarr from before the PG4 is untagged: an SG4). Saved in the checkpoint
+        # so the robot refuses the other gripper without needing this zarr.
+        self.gripper_tool = attrs.get('gripper_tool') or DEFAULT_GRIPPER_TOOL
         leaked = [c for c in ODOM_COLUMNS if c in state_cols]
         if leaked:
             raise ValueError(f"{zarr_path} state holds odometry {leaked}; reconvert it")
