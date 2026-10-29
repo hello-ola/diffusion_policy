@@ -38,8 +38,8 @@ BASE = slice(0, 3)            # base dims of the action
 # Which joints are held
 from stretch4_policy_recorder.common.held_joints import (  # noqa: E402
     JOINTS, decide_held_joints, format_hold_report)
-from stretch4_policy_recorder.common.raw import DEFAULT_GRIPPER_TOOL  # noqa: E402
-# A live dim whose true extremes normalize beyond this gets a warning.
+from stretch4_policy_recorder.common.stats_floor import floor_stats  # noqa: E402
+# A value whose true extremes normalize beyond this gets a warning.
 OUTLIER_WARN = 3.0
 
 
@@ -69,48 +69,44 @@ def se2_compose(anchor, rel):
                      th0 + dth], axis=-1)
 
 
-def make_masked_range_normalizer(data, frozen_std=1e-3, pct=1.0, verbose=True,
-                                 names=None):
-    """Per-dimension [-1, 1] range normalizer that refuses to amplify dead dimensions.
+def make_floored_range_normalizer(data, names, pct=1.0, verbose=True):
+    """Per-dimension [-1, 1] range normalizer that does not amplify barely-moving values.
 
-    Dimensions whose std is below `frozen_std` never actually moved during the
-    demonstrations. Min-max normalizing them stretches pure encoder noise to the
-    full output range, handing the policy a noise channel to fit. LinearNormalizer's
-    own `range_eps` (1e-4) does not catch these -- a joint held still still drifts a
-    few tenths of a millimetre, which is above that guard but far below any real
-    signal. Those dims are instead mean-centred with unit scale, so they contribute
-    a constant ~0 and denormalize back to the value they were pinned at.
+    Each value is scaled from its `pct`..`100-pct` percentiles. pct=0 is true min/max,
+    which the action needs: the scheduler's clip_sample clips predictions to [-1, 1], so
+    an action beyond the scale could never be produced at inference. The observation is
+    never clipped, so it can use pct=1 and ignore stray frames.
 
-    Live dimensions are scaled from the `pct`..`100-pct` percentiles. pct=0 is true
-    min/max, which the action needs: the scheduler's clip_sample clips predictions to
-    [-1, 1], so an action beyond the scale could never be produced at inference. The
-    observation is never clipped, so it can use pct=1 and ignore stray frames.
+    That range is then floored like every Stretch 4 dataset's stats
+    (stretch4_policy_recorder.common.stats_floor): a value the demos barely moved (or a
+    held joint, a constant by now) has a range of encoder noise, which min-max scaling
+    would stretch to the full output range and hand the policy a noise channel to fit.
+    Its range is widened to at least its floor around its centre, so it normalizes to ~0
+    and denormalizes back to where it was. Widening only grows the range, so every
+    recorded action still lands inside [-1, 1].
     """
     data = np.asarray(data, dtype=np.float32)
     stat = array_to_stats(data)
-    std = data.std(axis=0)
-    frozen = std < frozen_std
 
-    lo = np.percentile(data, pct, axis=0).astype(np.float32)
-    hi = np.percentile(data, 100.0 - pct, axis=0).astype(np.float32)
+    bounds = {'min': np.percentile(data, pct, axis=0).tolist(),
+              'max': np.percentile(data, 100.0 - pct, axis=0).tolist()}
+    floored = floor_stats(bounds, names)
+    lo = np.asarray(bounds['min'], dtype=np.float32)
+    hi = np.asarray(bounds['max'], dtype=np.float32)
     rng = hi - lo
-    rng[rng < 1e-8] = 1.0
+    rng[rng < 1e-8] = 1.0              # a value without a floor that never moved
 
     scale = (2.0 / rng).astype(np.float32)
     offset = (-1.0 - scale * lo).astype(np.float32)
 
-    scale[frozen] = 1.0
-    offset[frozen] = -stat['mean'][frozen]
-
-    # Live dims whose true extremes land far outside [-1, 1]: a few frames move much
+    # Values whose true extremes land far outside [-1, 1]: a few frames move much
     # more than the rest. Usually a joint used in one or two episodes -- see
     # decide_held_joints, which holds those before they reach this point.
     n_lo, n_hi = stat['min'] * scale + offset, stat['max'] * scale + offset
     extreme = np.maximum(np.abs(n_lo), np.abs(n_hi))
-    outliers = ~frozen & (extreme > OUTLIER_WARN)
-    if verbose and outliers.any():
-        for i in np.nonzero(outliers)[0]:
-            name = names[i] if names else str(i)
+    if verbose:
+        for i in np.nonzero(extreme > OUTLIER_WARN)[0]:
+            name = names[i]
             hint = (" If it is used in only a few episodes, consider task.hold.hold_joints."
                     if name in JOINTS else
                     " Heavy-tailed but real; fine as long as this is an observation (never"
@@ -118,14 +114,11 @@ def make_masked_range_normalizer(data, frozen_std=1e-3, pct=1.0, verbose=True,
             print(f"[stretch] NOTE {name}: normalizes to [{n_lo[i]:.1f}, {n_hi[i]:.1f}], "
                   f"the {pct:g}-{100 - pct:g}% range is [{lo[i]:.5g}, {hi[i]:.5g}] but the "
                   f"data spans [{stat['min'][i]:.5g}, {stat['max'][i]:.5g}].{hint}")
-
-    if verbose and frozen.any():
-        idx = np.nonzero(frozen)[0]
-        label = [(names[i] if names else str(i)) for i in idx]
-        print(f"[stretch] {frozen.sum()}/{len(frozen)} dims frozen in this dataset "
-              f"(std < {frozen_std}): {label}")
-        print(f"[stretch]   their std: {np.array2string(std[idx], precision=6)}")
-        print("[stretch]   -> mean-centred, not range-scaled (would amplify noise)")
+        if floored:
+            print("[stretch] ranges floored (spread before -> after): "
+                  + ", ".join(f"{n} {before:.3g} -> {after:.3g}"
+                              for n, fixed in floored.items()
+                              for before, after in fixed.values()))
 
     stat = dict(stat)
     stat['min'] = lo
@@ -162,8 +155,7 @@ class StretchImageDataset(BaseImageDataset):
                  max_train_episodes=None,
                  base_action='pose',
                  include_grip_effort=False,
-                 hold=None,
-                 frozen_std=1e-3):
+                 hold=None):
         super().__init__()
         zarr_path = os.path.expanduser(zarr_path)
         group = zarr.open(zarr_path, 'r')
@@ -201,12 +193,14 @@ class StretchImageDataset(BaseImageDataset):
                 "(the robot reads it from the checkpoint to decode the base).")
         state_cols = list(attrs['state_columns'])
         action_cols = list(attrs['action_columns'])
-        # SG4 or PG4 (a zarr from before the PG4 is untagged: an SG4). Saved in the checkpoint
-        # so the robot refuses the other gripper without needing this zarr.
-        self.gripper_tool = attrs.get('gripper_tool') or DEFAULT_GRIPPER_TOOL
+        # SG4 or PG4. Saved in the checkpoint so the robot refuses the other gripper without
+        # needing this zarr.
+        self.gripper_tool = attrs.get('gripper_tool')
+        if not self.gripper_tool:
+            raise ValueError(f"{zarr_path}: refused: no gripper_tool (SG4/PG4) in its attrs")
         leaked = [c for c in ODOM_COLUMNS if c in state_cols]
         if leaked:
-            raise ValueError(f"{zarr_path} state holds odometry {leaked}; reconvert it")
+            raise ValueError(f"{zarr_path}: refused: its state holds odometry {leaked}")
         if action_cols[BASE] != BASE_ACTION_COLUMNS[base_action]:
             raise ValueError(f"action columns {action_cols[BASE]} are not "
                              f"{BASE_ACTION_COLUMNS[base_action]} for base_action {base_action!r}")
@@ -275,7 +269,6 @@ class StretchImageDataset(BaseImageDataset):
         self.pad_after = pad_after
         self.n_obs_steps = n_obs_steps
         self.base_action = base_action
-        self.frozen_std = frozen_std
 
     def _hold(self, action=None, agent_pos=None):
         """Overwrite held joints with their constant, in place (see decide_held_joints)."""
@@ -333,14 +326,12 @@ class StretchImageDataset(BaseImageDataset):
     def get_normalizer(self, mode='limits', **kwargs):
         normalizer = LinearNormalizer()
         # true min/max (pct=0): clip_sample clips predictions to [-1, 1]
-        normalizer['action'] = make_masked_range_normalizer(
-            self._action_population(), pct=0.0,
-            frozen_std=self.frozen_std, names=self.action_names)
+        normalizer['action'] = make_floored_range_normalizer(
+            self._action_population(), self.action_names, pct=0.0)
 
         agent_pos = self.replay_buffer['state'][:][:, self.state_index]
         self._hold(agent_pos=agent_pos)
-        normalizer['agent_pos'] = make_masked_range_normalizer(
-            agent_pos, frozen_std=self.frozen_std, names=self.agent_names)
+        normalizer['agent_pos'] = make_floored_range_normalizer(agent_pos, self.agent_names)
 
         for k in self.rgb_keys:
             normalizer[k] = get_image_range_normalizer()

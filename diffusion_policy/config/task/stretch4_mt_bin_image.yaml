@@ -85,6 +85,3 @@ dataset:
     min_motion: {}
     hold_joints: []     # always held, e.g. [wrist_roll]
     keep_joints: []     # never held, even when rarely moved
-  # Dims whose std is below this never moved during the demos and are
-  # mean-centred instead of range-scaled, so they cannot become noise channels.
-  frozen_std: 1.0e-3
